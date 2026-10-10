@@ -1,0 +1,11 @@
+% RUN_ROLE1_TESTS
+% Builds the scenario and runs Role 1 validation.
+
+clear;
+clc;
+
+% Build the scenario ONCE
+S = build_role1_scenario();
+
+% Run the validation tests using that scenario
+results = test_role1(S);

@@ -1,126 +1,126 @@
+
 function [powerDbm, info] = getSignalPower( ...
     txSite, rxSite, ...
     txAz, txEl, rxAz, rxEl, ...
     txArray, rxArray, rayModel, f, txPowerDbm)
 %GETSIGNALPOWER Calculate received power for one Tx-Rx link.
 %
-% This is the central Role-1 function.
-%
-% Inputs:
-%   txSite, rxSite       txsite/rxsite objects
-%   txAz, txEl           Tx steering azimuth/elevation [deg]
-%   rxAz, rxEl           Rx steering azimuth/elevation [deg]
-%   txArray, rxArray     phased array objects
-%   rayModel             ray-tracing propagationModel
-%   f                    carrier frequency [Hz]
-%   txPowerDbm           transmit power [dBm]
-%
-% Outputs:
-%   powerDbm             received signal power [dBm]
-%   info                 diagnostic structure
+% Angles are in degrees.
+% Received power = Tx power + Tx gain - path loss + Rx gain.
 
-% Default diagnostic structure
-info = struct( ...
-    'validPath', false, ...
-    'pathLossDb', NaN, ...
-    'txGainDb', NaN, ...
-    'rxGainDb', NaN, ...
-    'aodDeg', [NaN NaN], ...
-    'aoaDeg', [NaN NaN], ...
-    'phaseShiftDeg', NaN, ...
-    'propagationDelaySec', NaN, ...
-    'selectedPathIndex', NaN, ...
-    'numRays', 0);
+    powerDbm = -Inf;
 
-powerDbm = -Inf;
+    info = struct( ...
+        'validPath', false, ...
+        'pathLossDb', NaN, ...
+        'txGainDb', NaN, ...
+        'rxGainDb', NaN, ...
+        'aodDeg', [NaN NaN], ...
+        'aoaDeg', [NaN NaN], ...
+        'phaseShiftDeg', NaN, ...
+        'propagationDelaySec', NaN, ...
+        'selectedPathIndex', NaN, ...
+        'numRays', 0);
 
-% ------------------------------------------------------------
-% 1. Ray trace the physical Tx -> Rx link
-% ------------------------------------------------------------
-rays = raytrace(txSite, rxSite, rayModel);
+    %% 1. Trace propagation paths
+    rays = raytrace(txSite, rxSite, rayModel);
 
-if isempty(rays) || isempty(rays{1})
-    return;
-end
+    if isempty(rays) || isempty(rays{1})
+        warning('getSignalPower:NoPath', ...
+            'No propagation path was found between Tx and Rx.');
+        return;
+    end
 
-pathList = rays{1};
-info.numRays = numel(pathList);
+    pathList = rays{1};
+    info.numRays = numel(pathList);
 
-% Select the path with the smallest path loss.
-% This is a robust Week-1 choice for the strongest path.
-pathLosses = [pathList.PathLoss];
-[~, selectedIndex] = min(pathLosses);
-ray = pathList(selectedIndex);
+    %% 2. Select the path with minimum path loss
+    pathLosses = [pathList.PathLoss];
+    [~, selectedIndex] = min(pathLosses);
 
-info.selectedPathIndex = selectedIndex;
-info.pathLossDb = ray.PathLoss;
+    ray = pathList(selectedIndex);
 
-% ------------------------------------------------------------
-% 2. Extract propagation directions
-% ------------------------------------------------------------
-aod = normalizeAnglePair(ray.AngleOfDeparture);
-aoa = normalizeAnglePair(ray.AngleOfArrival);
+    info.selectedPathIndex = selectedIndex;
+    info.pathLossDb = ray.PathLoss;
 
-info.aodDeg = aod;
-info.aoaDeg = aoa;
+    %% 3. Obtain ray departure and arrival angles
+    aod = normalizeAnglePair(ray.AngleOfDeparture);
+    aoa = normalizeAnglePair(ray.AngleOfArrival);
 
-% Optional ray fields
-if isprop(ray, 'PhaseShift')
-    info.phaseShiftDeg = ray.PhaseShift;
-end
+    info.aodDeg = aod;
+    info.aoaDeg = aoa;
 
-if isprop(ray, 'PropagationDelay')
-    info.propagationDelaySec = ray.PropagationDelay;
-end
+    if isprop(ray, 'PhaseShift')
+        info.phaseShiftDeg = ray.PhaseShift;
+    end
 
-% ------------------------------------------------------------
-% 3. Tx beamforming gain at the ray's actual departure angle
-% ------------------------------------------------------------
-wTx = steering_weights(txArray, f, txAz, txEl);
+    if isprop(ray, 'PropagationDelay')
+        info.propagationDelaySec = ray.PropagationDelay;
+    end
 
-gainTxDb = pattern( ...
-    txArray, f, ...
-    aod(1), aod(2), ...
-    Weights=wTx, ...
-    Type="powerdb");
+    %% 4. Calculate transmit array response
+    wTx = steering_weights(txArray, f, txAz, txEl);
 
-% ------------------------------------------------------------
-% 4. Rx beamforming gain at the ray's actual arrival angle
-% ------------------------------------------------------------
-wRx = steering_weights(rxArray, f, rxAz, rxEl);
+    txPattern = pattern( ...
+        txArray, f, ...
+        aod(1), aod(2), ...
+        'Weights', wTx, ...
+        'Type', 'directivity');
 
-gainRxDb = pattern( ...
-    rxArray, f, ...
-    aoa(1), aoa(2), ...
-    Weights=wRx, ...
-    Type="powerdb");
+    gainTxDb = txPattern(1);
 
-% Convert scalar outputs defensively.
-gainTxDb = gainTxDb(1);
-gainRxDb = gainRxDb(1);
+    %% 5. Reverse arrival direction for receive array
+    % The ray's arrival angles describe the incoming propagation
+    % direction. The receive array response is evaluated toward
+    % the source, i.e. the opposite direction.
+    rxPatternAz = mod(aoa(1) + 360, 360);
+    rxPatternAz = mod(rxPatternAz + 180 + 180, 360) - 180;
+    rxPatternEl = -aoa(2);
 
-info.txGainDb = gainTxDb;
-info.rxGainDb = gainRxDb;
-info.validPath = true;
+    %% 6. Calculate receive array response
+    wRx = steering_weights(rxArray, f, rxAz, rxEl);
 
-% ------------------------------------------------------------
-% 5. Link budget
-%
-% Pr[dBm] = Pt[dBm] + Gtx[dB] - PathLoss[dB] + Grx[dB]
-% ------------------------------------------------------------
-powerDbm = txPowerDbm + gainTxDb - ray.PathLoss + gainRxDb;
+    rxPattern = pattern( ...
+        rxArray, f, ...
+        rxPatternAz, rxPatternEl, ...
+        'Weights', wRx, ...
+        'Type', 'directivity');
+
+    gainRxDb = rxPattern(1);
+
+    %% 7. Store gains
+    info.txGainDb = gainTxDb;
+    info.rxGainDb = gainRxDb;
+
+    %% 8. Validate gain values
+    if ~isfinite(gainTxDb) || ~isfinite(gainRxDb)
+        warning('getSignalPower:InvalidGain', ...
+            ['Antenna gain is not finite. Check steering weights, ', ...
+             'array orientation, and ray angle conventions.']);
+        return;
+    end
+
+    %% 9. Calculate received power in dBm
+    powerDbm = txPowerDbm ...
+             + gainTxDb ...
+             - ray.PathLoss ...
+             + gainRxDb;
+
+    info.validPath = true;
 
 end
 
 
 function ang = normalizeAnglePair(raw)
-% Normalize a ray angle into [azimuth elevation].
+% Convert ray angles to a row vector [azimuth elevation].
 
-raw = double(raw(:));
+    raw = double(raw(:));
 
-if numel(raw) < 2
-    error('Unexpected ray angle format.');
-end
+    if numel(raw) < 2
+        error('getSignalPower:InvalidRayAngles', ...
+            'Ray angles must contain azimuth and elevation.');
+    end
 
-ang = raw(1:2).';
+    ang = raw(1:2).';
+
 end
